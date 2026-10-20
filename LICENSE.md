@@ -1,22 +1,28 @@
 # License Overview 双许可总览
 
-HARC 采用**双许可（Dual Licensing）**发布。你在使用前只需根据自身身份选择其一：
+**一句话：个人免费用，商业用付费。**
 
-## 1. PolyForm Noncommercial 1.0.0 —— 个人与组织免费
+HARC 采用**双许可（Dual Licensing）**发布。使用前按你的身份选一条即可：
 
-完整文本见 [LICENSE-POLYFORM.md](LICENSE-POLYFORM.md)。
+| 你是谁 | 适用的许可 | 费用 |
+|---|---|---|
+| **个人**：学习、研究、试验、爱好项目、业余作品 | [PolyForm Noncommercial 1.0.0](LICENSE-POLYFORM.md) | **永久免费** |
+| 非营利组织：慈善、教育、公共研究、公共安全/卫生、环保、政府机构 | [PolyForm Noncommercial 1.0.0](LICENSE-POLYFORM.md) | **免费** |
+| **公司 / 个体经营者 / 任何营利实体**（内部系统、嵌入产品、SaaS、闭源分发） | [商业许可](COMMERCIAL-LICENSE.md) | **需购买授权** |
 
-适用于**非商业目的**，包括但不限于：
+## 1. PolyForm Noncommercial 1.0.0 —— 个人与非营利组织免费
+
+完整法律文本见 [LICENSE-POLYFORM.md](LICENSE-POLYFORM.md)。适用于**非商业目的**：
 
 - 个人学习、研究、试验、爱好项目、业余追求
 - 科研与公开发表（以公共利益为目的的研究）
 - 慈善组织、教育机构、公共研究机构、公共安全/卫生组织、环保组织、政府机构
-  的使用（无论其资金来源如何）
+  （无论其资金来源如何）
 
-## 2. 商业许可 —— 企业与营利组织
+## 2. 商业许可 —— 企业与营利组织付费
 
-任何**营利性实体**（公司、个体经营者、及其关联机构）出于任何商业目的使用 HARC
-（包括内部业务系统、嵌入产品、SaaS 服务、闭源分发），都需要一份商业许可。
+任何**营利性实体**（公司、个体经营者及其关联机构）出于任何商业目的使用 HARC
+（内部业务系统、嵌入产品、SaaS 服务、闭源分发），都需要一份商业许可。
 
 商业授权条款、档位与联系方式见 [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)。
 
