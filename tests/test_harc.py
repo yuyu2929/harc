@@ -168,3 +168,49 @@ def test_negative_varint_rejected():
     from harc import put_varint
     with pytest.raises(ValueError):
         put_varint(bytearray(), -1)
+
+
+# ---------------- v3 分块容器 ----------------
+
+@pytest.mark.parametrize("kind", ["uniform", "blocks", "smooth", "noise"])
+def test_v3_roundtrip(kind):
+    """v3（分块）与 v2 解出的值必须完全一致。"""
+    a = gen(kind, 300)
+    e3 = encode(a, chunk=64)
+    assert np.array_equal(decode(e3), a)
+    assert np.array_equal(decode(e3), decode(encode(a)))
+
+
+def test_v3_region_and_setpixel():
+    a = gen("smooth", 320)
+    e3 = encode(a, chunk=64)
+    assert np.array_equal(decode_region(e3, 10, 200, 30, 250), a[10:200, 30:250])
+    b = set_pixel(e3, 137, 233, -424242)
+    a2 = a.copy(); a2[137, 233] = -424242
+    assert np.array_equal(decode(b), a2)
+    # 多次更新同一块与不同块
+    for r, c, v in [(0, 0, 1), (319, 319, 2), (160, 160, 3)]:
+        b = set_pixel(b, r, c, v)
+        a2[r, c] = v
+    assert np.array_equal(decode(b), a2)
+
+
+def test_v3_dtype_preserved():
+    a = (RNG.integers(0, 100, (130, 170))).astype(np.int16)
+    assert decode(encode(a, chunk=64)).dtype == np.int16
+
+
+def test_v3_chunk_validation():
+    a = np.zeros((16, 16), dtype=np.int32)
+    with pytest.raises(ValueError):
+        encode(a, chunk=4)          # 太小
+    with pytest.raises(ValueError):
+        encode(a, chunk=0)
+
+
+def test_v3_crc_detects_corruption():
+    a = gen("noise", 128)
+    blob = bytearray(encode(a, chunk=64))
+    blob[len(blob) // 2] ^= 0xFF
+    with pytest.raises(ValueError):
+        decode(bytes(blob))

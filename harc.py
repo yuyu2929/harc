@@ -40,8 +40,9 @@ import zlib
 import numpy as np
 
 MAGIC = b"HARC"
-__version__ = "1.1.0"      # 包版本（与码流格式版本 VERSION 无关）
+__version__ = "1.2.0"      # 包版本（与码流格式版本 VERSION 无关）
 VERSION = 2          # v2：头部增加 dtype 字节 + 尾部增加 CRC32；读端仍兼容 v1
+VERSION_TILED = 3    # v3：分块容器（chunk 参数启用），每块独立子树
 VERSION_MIN = 1
 TAG_UNIFORM, TAG_RLE, TAG_PRED, TAG_QUAD = 0, 1, 2, 3
 
@@ -266,7 +267,67 @@ def _best_leaf(block, ctx):
 
 # ---------------- 主编码 / 全图解码 ----------------
 
-def encode(arr: np.ndarray, min_leaf: int = 32) -> bytes:
+def _enc_node(b: np.ndarray, min_leaf: int, ctx: int) -> bytes:
+    """编码一个节点，返回 [tag][payload]。v2 单树与 v3 分块共用。"""
+    h, w = b.shape
+    if np.all(b == b[0, 0]):                       # UNIFORM：任何层级都最优先
+        out = bytearray([TAG_UNIFORM])
+        put_varint(out, zigzag(int(b[0, 0]) - ctx))
+        return bytes(out)
+
+    # 任一边不足 2 时无法四分（会产生 0 高/宽子块），强制成叶
+    is_leaf = (h <= min_leaf and w <= min_leaf) or h < 2 or w < 2
+    rle = _enc_rle_bytes(b, ctx)
+    pred = _enc_pred_bytes(b)
+    cand = [(len(rle), TAG_RLE, rle), (len(pred), TAG_PRED, pred)]
+
+    if not is_leaf:                                # 内部节点允许"提前成叶"
+        ch, cw = h // 2, w // 2
+        sub = bytearray()
+        for r0, r1, c0, c1 in ((0, ch, 0, cw), (0, ch, cw, w),
+                               (ch, h, 0, cw), (ch, h, cw, w)):
+            sub += _enc_node(b[r0:r1, c0:c1], min_leaf, ctx)
+        cand.append((len(sub) + 1, TAG_QUAD, bytes(sub)))
+
+    cand.sort(key=lambda x: x[0])
+    _, tag, payload = cand[0]
+    out = bytearray([tag])
+    if tag in (TAG_RLE, TAG_PRED):
+        put_varint(out, len(payload))
+    out += payload                                 # RLE/PRED: 载荷；QUAD: 全部子节点
+    return bytes(out)
+
+
+def _dec_node(rd: "Reader", hh: int, ww: int, ctx: int) -> np.ndarray:
+    """解码一个节点（从 rd 当前位置起）。"""
+    tag = rd.byte()
+    if tag == TAG_UNIFORM:
+        return np.full((hh, ww), ctx + unzigzag(rd.varint()), dtype=np.int64)
+    if tag in (TAG_RLE, TAG_PRED):
+        return _dec_leaf(tag, rd.take(rd.varint()), hh, ww, ctx)
+    ch, cw = hh // 2, ww // 2
+    out = np.empty((hh, ww), dtype=np.int64)
+    out[:ch, :cw] = _dec_node(rd, ch, cw, ctx)
+    out[:ch, cw:] = _dec_node(rd, ch, ww - cw, ctx)
+    out[ch:, :cw] = _dec_node(rd, hh - ch, cw, ctx)
+    out[ch:, cw:] = _dec_node(rd, hh - ch, ww - cw, ctx)
+    return out
+
+
+def _tiles(h: int, w: int, chunk: int):
+    """按 chunk 切块，yield (r0, c0, th, tw)。"""
+    for r0 in range(0, h, chunk):
+        for c0 in range(0, w, chunk):
+            yield r0, c0, min(chunk, h - r0), min(chunk, w - c0)
+
+
+def encode(arr: np.ndarray, min_leaf: int = 32, chunk: int | None = None) -> bytes:
+    """无损编码。
+
+    chunk=None  -> v2 单树（整幅一个四叉树）
+    chunk=N     -> v3 分块容器：每 N×N 一个独立子树，set_pixel 只重编所在块，
+                   写入成本从"重编整幅"降到"重编 1/(块数)"。
+    """
     a = np.asarray(arr)
     if a.ndim != 2:
         raise ValueError("仅支持二维栅格")
@@ -276,6 +337,8 @@ def encode(arr: np.ndarray, min_leaf: int = 32) -> bytes:
         raise ValueError(f"单边尺寸超过上限 {MAX_SIDE}")
     if min_leaf < 1:
         raise ValueError("min_leaf 必须 >= 1")
+    if chunk is not None and (chunk < 8 or chunk > MAX_SIDE):
+        raise ValueError("chunk 必须在 [8, MAX_SIDE] 内")
 
     code = DTYPE_CODES.get(a.dtype)
     if code is None:
@@ -283,45 +346,27 @@ def encode(arr: np.ndarray, min_leaf: int = 32) -> bytes:
     if a.dtype == np.uint64 and a.size and int(a.max()) > np.iinfo(np.int64).max:
         raise ValueError("uint64 数值超出 int64 范围，暂不支持")
 
+    a64 = a.astype(np.int64, copy=False)
     head = bytearray()
     head += MAGIC
-    put_varint(head, VERSION)
-    put_varint(head, code)                             # v2：新增 dtype 字节
+    put_varint(head, VERSION if chunk is None else VERSION_TILED)
+    put_varint(head, code)
     put_varint(head, a.shape[0])
     put_varint(head, a.shape[1])
     put_varint(head, min_leaf)
+    if chunk is None:
+        return _finalize(bytes(head), _enc_node(a64, min_leaf, 0))
 
-    def enc_node(b: np.ndarray, ctx: int) -> bytes:
-        h, w = b.shape
-        if np.all(b == b[0, 0]):                       # UNIFORM：任何层级都最优先
-            out = bytearray([TAG_UNIFORM])
-            put_varint(out, zigzag(int(b[0, 0]) - ctx))
-            return bytes(out)
-
-        # 任一边不足 2 时无法四分（会产生 0 高/宽子块），强制成叶
-        is_leaf = (h <= min_leaf and w <= min_leaf) or h < 2 or w < 2
-        rle = _enc_rle_bytes(b, ctx)
-        pred = _enc_pred_bytes(b)
-        cand = [(len(rle), TAG_RLE, rle), (len(pred), TAG_PRED, pred)]
-
-        if not is_leaf:                                # 内部节点允许"提前成叶"
-            ch, cw = h // 2, w // 2
-            sub = bytearray()
-            for r0, r1, c0, c1 in ((0, ch, 0, cw), (0, ch, cw, w),
-                                   (ch, h, 0, cw), (ch, h, cw, w)):
-                sub += enc_node(b[r0:r1, c0:c1], ctx)
-            cand.append((len(sub) + 1, TAG_QUAD, bytes(sub)))
-
-        cand.sort(key=lambda x: x[0])
-        _, tag, payload = cand[0]
-        out = bytearray([tag])
-        if tag in (TAG_RLE, TAG_PRED):
-            put_varint(out, len(payload))
-        out += payload                                 # RLE/PRED: 载荷；QUAD: 全部子节点
-        return bytes(out)
-
-    body = enc_node(a.astype(np.int64, copy=False), 0)
-    return _finalize(bytes(head), body)
+    put_varint(head, chunk)
+    bodies = [_enc_node(a64[r0:r0 + th, c0:c0 + tw], min_leaf, 0)
+              for r0, c0, th, tw in _tiles(a.shape[0], a.shape[1], chunk)]
+    body = bytearray()
+    put_varint(body, len(bodies))
+    for b in bodies:
+        put_varint(body, len(b))
+    for b in bodies:
+        body += b
+    return _finalize(bytes(head), bytes(body))
 
 
 def _finalize(head: bytes, body: bytes) -> bytes:
@@ -342,7 +387,7 @@ def _read_header(data: bytes):
         raise ValueError("不是 HARC 码流（magic 不匹配或长度不足）")
     rd = Reader(data, 4)
     version = rd.varint()
-    if not (VERSION_MIN <= version <= VERSION):
+    if not (VERSION_MIN <= version <= VERSION_TILED):
         raise ValueError(f"不支持的版本：{version}")
     code = rd.varint() if version >= 2 else LEGACY_DTYPE_CODE
     if code not in CODE_DTYPES:
@@ -354,6 +399,12 @@ def _read_header(data: bytes):
     if min_leaf < 1:
         raise ValueError("min_leaf 非法")
 
+    chunk = None
+    if version >= VERSION_TILED:
+        chunk = rd.varint()
+        if chunk < 8:
+            raise ValueError("chunk 非法")
+
     if version >= 2:
         if len(data) < rd.pos + 4:
             raise ValueError("码流截断：缺少 CRC32")
@@ -364,7 +415,7 @@ def _read_header(data: bytes):
             raise ValueError(f"CRC32 校验失败（期望 {want:08x}，实际 {got:08x}），数据已损坏")
         rd.limit = body_end
 
-    return rd, h, w, min_leaf, code, version
+    return rd, h, w, min_leaf, code, version, chunk
 
 
 def _skip_node(rd: Reader, hh: int, ww: int) -> None:
@@ -383,25 +434,23 @@ def _skip_node(rd: Reader, hh: int, ww: int) -> None:
 
 
 def decode(data: bytes) -> np.ndarray:
-    rd, h, w, _min_leaf, code, _ver = _read_header(data)
+    rd, h, w, _min_leaf, code, version, chunk = _read_header(data)
 
-    def dec_node(hh: int, ww: int, ctx: int) -> np.ndarray:
-        tag = rd.byte()
-        if tag == TAG_UNIFORM:
-            return np.full((hh, ww), ctx + unzigzag(rd.varint()), dtype=np.int64)
-        if tag in (TAG_RLE, TAG_PRED):
-            ln = rd.varint()
-            payload = rd.take(ln)
-            return _dec_leaf(tag, payload, hh, ww, ctx)
-        ch, cw = hh // 2, ww // 2                      # QUAD
-        out = np.empty((hh, ww), dtype=np.int64)
-        out[:ch, :cw] = dec_node(ch, cw, ctx)
-        out[:ch, cw:] = dec_node(ch, ww - cw, ctx)
-        out[ch:, :cw] = dec_node(hh - ch, cw, ctx)
-        out[ch:, cw:] = dec_node(hh - ch, ww - cw, ctx)
-        return out
+    if version >= VERSION_TILED:
+        out = np.empty((h, w), dtype=np.int64)
+        n = rd.varint()
+        lens = [rd.varint() for _ in range(n)]
+        tiles = list(_tiles(h, w, chunk))
+        if n != len(tiles):
+            raise ValueError(f"分块数量不符（头写 {n}，几何应为 {len(tiles)}）")
+        for (r0, c0, th, tw), ln in zip(tiles, lens):
+            sub = Reader(rd.take(ln))
+            out[r0:r0 + th, c0:c0 + tw] = _dec_node(sub, th, tw, 0)
+            if sub.pos != len(sub.data):
+                raise ValueError("分块内有未解析字节")
+    else:
+        out = _dec_node(rd, h, w, 0)
 
-    out = dec_node(h, w, 0)
     if rd.pos != rd.limit:
         raise ValueError(f"码流尾部有多余数据（解析到 {rd.pos}，应为 {rd.limit}）")
     return out.astype(CODE_DTYPES[code], copy=False)
@@ -410,12 +459,33 @@ def decode(data: bytes) -> np.ndarray:
 # ---------------- 区域随机解码 ----------------
 
 def decode_region(data: bytes, r0: int, r1: int, c0: int, c1: int) -> np.ndarray:
-    rd, h, w, _min_leaf, code, _ver = _read_header(data)
+    rd, h, w, _min_leaf, code, version, chunk = _read_header(data)
     r0, r1 = max(0, r0), min(h, r1)
     c0, c1 = max(0, c0), min(w, c1)
     if r1 <= r0 or c1 <= c0:
         return np.empty((max(0, r1 - r0), max(0, c1 - c0)), dtype=CODE_DTYPES[code])
     out = np.empty((r1 - r0, c1 - c0), dtype=np.int64)
+
+    if version >= VERSION_TILED:
+        # v3：只解码与窗口相交的分块，其余块只按长度跳过（不解压）
+        n = rd.varint()
+        lens = [rd.varint() for _ in range(n)]
+        tiles = list(_tiles(h, w, chunk))
+        if n != len(tiles):
+            raise ValueError(f"分块数量不符（头写 {n}，几何应为 {len(tiles)}）")
+        for (tr0, tc0, th, tw), ln in zip(tiles, lens):
+            body = rd.take(ln)
+            ir0, ir1 = max(r0, tr0), min(r1, tr0 + th)
+            ic0, ic1 = max(c0, tc0), min(c1, tc0 + tw)
+            if ir0 >= ir1 or ic0 >= ic1:
+                continue
+            sub = Reader(body)
+            blk = _dec_node(sub, th, tw, 0)
+            out[ir0 - r0:ir1 - r0, ic0 - c0:ic1 - c0] = \
+                blk[ir0 - tr0:ir1 - tr0, ic0 - tc0:ic1 - tc0]
+        if rd.pos != rd.limit:
+            raise ValueError(f"码流尾部有多余数据（解析到 {rd.pos}，应为 {rd.limit}）")
+        return out.astype(CODE_DTYPES[code], copy=False)
 
     def skip(hh: int, ww: int) -> None:
         tag = rd.byte()
@@ -466,10 +536,52 @@ def decode_region(data: bytes, r0: int, r1: int, c0: int, c1: int) -> np.ndarray
 
 # ---------------- 局部更新：只重编像素所在叶子 ----------------
 
+def _set_pixel_tiled(data: bytes, rd: "Reader", h: int, w: int, min_leaf: int,
+                     code: int, chunk: int, r: int, c: int, value: int) -> bytes:
+    """v3：只重编目标块，其余块的字节原样搬运（不做压缩/解压）。"""
+    n = rd.varint()
+    lens = [rd.varint() for _ in range(n)]
+    bodies = [rd.take(ln) for ln in lens]
+    tiles = list(_tiles(h, w, chunk))
+    if n != len(tiles):
+        raise ValueError(f"分块数量不符（头写 {n}，几何应为 {len(tiles)}）")
+
+    hit = None
+    for i, (tr0, tc0, th, tw) in enumerate(tiles):
+        if tr0 <= r < tr0 + th and tc0 <= c < tc0 + tw:
+            hit = (i, tr0, tc0, th, tw)
+            break
+    if hit is None:
+        raise IndexError(f"坐标越界：({r},{c}) 不在 {h}x{w} 内")
+
+    i, tr0, tc0, th, tw = hit
+    sub = Reader(bodies[i])
+    blk = _dec_node(sub, th, tw, 0)
+    blk[r - tr0, c - tc0] = value
+    bodies[i] = _enc_node(blk, min_leaf, 0)
+
+    head = bytearray(MAGIC)
+    put_varint(head, VERSION_TILED)
+    put_varint(head, code)
+    put_varint(head, h)
+    put_varint(head, w)
+    put_varint(head, min_leaf)
+    put_varint(head, chunk)
+    body = bytearray()
+    put_varint(body, n)
+    for b in bodies:
+        put_varint(body, len(b))
+    for b in bodies:
+        body += b
+    return _finalize(bytes(head), bytes(body))
+
+
 def set_pixel(data: bytes, r: int, c: int, value: int) -> bytes:
-    rd, h, w, min_leaf, code, _ver = _read_header(data)
+    rd, h, w, min_leaf, code, version, chunk = _read_header(data)
     if not (0 <= r < h and 0 <= c < w):
         raise IndexError(f"坐标越界：({r},{c}) 不在 {h}x{w} 内")
+    if version >= VERSION_TILED:
+        return _set_pixel_tiled(data, rd, h, w, min_leaf, code, chunk, r, c, value)
 
     # --- 1) 定位叶子：记录其在码流中的起始偏移、几何信息与上下文 ---
     def walk(hh, ww, gr0, gc0, ctx):
