@@ -32,3 +32,8 @@ test = ["pytest>=7"]
 
 [tool.setuptools]
 py-modules = ["harc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 双保险：老版本 pytest 没有 pythonpath 选项时由 conftest.py 兜底
+pythonpath = ["."]
