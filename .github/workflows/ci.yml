@@ -21,7 +21,10 @@ jobs:
       - run: pip install numpy pytest
       - run: pytest tests/ -v
       - name: Self-check (roundtrip on odd sizes)
-        # Windows runner 上没有 python3，统一用 python
+        # Windows runner 上没有 python3，统一用 python；
+        # 再兜一层 PYTHONIOENCODING，避免中文输出撞上 cp1252 控制台
+        env:
+          PYTHONIOENCODING: utf-8
         run: python harc.py
 
   benchmark:

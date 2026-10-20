@@ -36,6 +36,7 @@ HARC —— Hybrid Adaptive Raster Coding（混合自适应栅格编码）v1.0
 """
 
 from __future__ import annotations
+import sys
 import zlib
 import numpy as np
 
@@ -685,6 +686,13 @@ def set_pixel(data: bytes, r: int, c: int, value: int) -> bytes:
 # ---------------- 自检 ----------------
 
 if __name__ == "__main__":
+    # Windows 控制台默认 cp1252/cp936，直接打印中文会 UnicodeEncodeError。
+    # 这里主动切 UTF-8 并允许替换，保证自检在任何终端都能跑完。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     rng = np.random.default_rng(7)
 
     def gen(kind, n):
