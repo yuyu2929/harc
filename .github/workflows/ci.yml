@@ -10,7 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 未纳入 macos-latest：本账号的 macOS runner 排队后 0 步取消（配额问题），
+        # 会让每次推送都显示失败，掩盖真实问题。
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.9", "3.11", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
